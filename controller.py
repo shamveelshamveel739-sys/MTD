@@ -3,25 +3,21 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet
-from ryu.lib.packet import ethernet
-from ryu.lib.packet import ether_types
-import random
-import time
 from threading import Thread
+import random
+import sys
 
 class PortShuffleMTD(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
     def __init__(self, *args, **kwargs):
         super(PortShuffleMTD, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}
-        self.port_map = {}  # To track original_port -> shuffled_port mapping per datapath
-        self.shuffle_interval = 30  # seconds
         self.datapaths = {}
-        self.running = True
-        # Start background thread to shuffle ports periodically
-        t = Thread(target=self._shuffle_ports_periodically)
+        self.original_ports = [8010, 8025, 8050]        # demo candidate ports
+        self.last_allowed_port = None
+        # Start input-wait thread to shuffle on keypress
+        t = Thread(target=self.keypress_trigger)
+        t.daemon = True
         t.start()
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -31,12 +27,14 @@ class PortShuffleMTD(app_manager.RyuApp):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Install table-miss flow entry
+        # Initial table-miss entry
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
                                           ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
-        self.port_map[datapath.id] = {}
+
+        # Install initial port shuffle (random)
+        self.shuffle_ports(datapath)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
@@ -53,85 +51,56 @@ class PortShuffleMTD(app_manager.RyuApp):
                                     match=match, instructions=inst)
         datapath.send_msg(mod)
 
-    def _shuffle_ports_periodically(self):
-        while self.running:
-            time.sleep(self.shuffle_interval)
-            self.logger.info("Shuffling ports for MTD")
+    def keypress_trigger(self):
+        # Wait for Enter, then shuffle ports
+        while True:
+            key = input("Press Enter to shuffle allowed port...\n")
+            self.logger.info("Shuffling ports for MTD...")
             for dpid, datapath in self.datapaths.items():
-                self._shuffle_ports(datapath)
+                self.shuffle_ports(datapath)
 
-    def _shuffle_ports(self, datapath):
+    def shuffle_ports(self, datapath):
         parser = datapath.ofproto_parser
         ofproto = datapath.ofproto
-        # Example logic: shuffle ports 8000-8010 mapping to random available ports
-        original_ports = list(range(8000, 8011))
-        shuffled_ports = original_ports[:]
-        random.shuffle(shuffled_ports)
 
-        self.port_map[datapath.id] = dict(zip(original_ports, shuffled_ports))
+        allowed_port = random.choice(self.original_ports)
+        self.last_allowed_port = allowed_port
 
-        # Remove old flow entries for these ports
-        for port in original_ports:
-            match = parser.OFPMatch(in_port=port)
+        # Clean up previous flows for all candidate ports
+        for port in self.original_ports:
+            match = parser.OFPMatch(tcp_dst=port)
             mod = parser.OFPFlowMod(datapath=datapath, command=ofproto.OFPFC_DELETE,
                                     out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
                                     match=match)
             datapath.send_msg(mod)
 
-        # Install new flows with shuffled ports mapping
-        for original, shuffled in self.port_map[datapath.id].items():
-            match = parser.OFPMatch(tcp_dst=original)
-            actions = [parser.OFPActionSetField(tcp_dst=shuffled),
-                       parser.OFPActionOutput(ofproto.OFPP_NORMAL)]
-            self.add_flow(datapath, 10, match, actions)
+        # Install new rules
+        for port in self.original_ports:
+            match = parser.OFPMatch(ip_proto=6, tcp_dst=port)
+            if port == allowed_port:
+                # Forward to h1 (port 2)
+                actions = [parser.OFPActionOutput(2)]
+                self.add_flow(datapath, 100, match, actions)
+            else:
+                # Drop all other candidate ports
+                actions = []
+                self.add_flow(datapath, 10, match, actions)
 
-        self.logger.info(f"Port shuffle mapping for switch {datapath.id}: {self.port_map[datapath.id]}")
+        self.logger.info(f"Allowed port is NOW: {allowed_port}")
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
+        # Learning switch fallback - not affecting TCP rules above
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
 
-        pkt = packet.Packet(msg.data)
-        eth = pkt.get_protocols(ethernet.ethernet)[0]
-
-        if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            # ignore lldp packet
-            return
-        dst = eth.dst
-        src = eth.src
-
-        dpid = datapath.id
-        self.mac_to_port.setdefault(dpid, {})
-
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
-
-        # learn a mac address to avoid FLOOD next time.
-        self.mac_to_port[dpid][src] = in_port
-
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
-        else:
-            out_port = ofproto.OFPP_FLOOD
-
-        actions = [parser.OFPActionOutput(out_port)]
-
-        # install a flow to avoid packet_in next time
-        if out_port != ofproto.OFPP_FLOOD:
-            match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                self.add_flow(datapath, 1, match, actions, msg.buffer_id)
-                return
-            else:
-                self.add_flow(datapath, 1, match, actions)
-
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
-
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
-                                  in_port=in_port, actions=actions, data=data)
+        # No packet_in custom logic needed for port shuffle
+        # Just basic learning switch below (optional)
+        pkt = msg.data
+        actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=ofproto.OFP_NO_BUFFER,
+                                  in_port=in_port, actions=actions, data=pkt)
         datapath.send_msg(out)
