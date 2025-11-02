@@ -18,8 +18,8 @@ class CoordinatedPortShuffleMTD(app_manager.RyuApp):
         self.current_allowed_port = None
         self.sender_socket_port = 9999  # Port where sender listens for notifications
 
-        # Start manual input thread
-        t = Thread(target=self._manual_shuffler)
+        # Start periodic shuffle thread
+        t = Thread(target=self._periodic_shuffler)
         t.daemon = True
         t.start()
 
@@ -43,11 +43,11 @@ class CoordinatedPortShuffleMTD(app_manager.RyuApp):
                                 instructions=inst, idle_timeout=idle_timeout, hard_timeout=hard_timeout)
         datapath.send_msg(mod)
 
-    def _manual_shuffler(self):
+    def _periodic_shuffler(self):
         while True:
-            input("Press Enter to shuffle MTD port...\n")
             for dpid, datapath in self.datapaths.items():
                 self._coordinated_shuffle(datapath)
+            time.sleep(30)  # Shuffle every 30 seconds
 
     def _coordinated_shuffle(self, datapath):
         parser = datapath.ofproto_parser
