@@ -81,7 +81,7 @@ class PortRESTAPI(ControllerBase):
         super(PortRESTAPI, self).__init__(req, link, data, **config)
         self.coordinator = data['coordinator']
 
-    @route('/getport', methods=['GET'])
+    @route('get_port', '/getport', methods=['GET'])
     def get_port(self, req, **kwargs):
         body = str(self.coordinator.current_allowed_port)
         return Response(content_type='text/plain', body=body)
