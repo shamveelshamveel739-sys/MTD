@@ -20,11 +20,10 @@ HOST_MAC_TABLE = {
     '10.0.0.8': '00:00:00:00:00:08'
 }
 
-GRACE_PERIOD = 20  # seconds that old mapping is kept alive
+GRACE_PERIOD = 20  # seconds to keep old mappings active
 
 class EventMessage(event.EventBase):
     def __init__(self, message):
-        print("Creating Event")
         super(EventMessage, self).__init__()
         self.msg = message
 
@@ -58,6 +57,7 @@ class MovingTargetDefense(app_manager.RyuApp):
         self.datapaths = set()
         self.HostAttachments = {}
         self.prev_R2V_Mappings = {}
+        self.active_flows = {}  # track active sessions keyed by (src_ip,dst_ip)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def handleSwitchFeatures(self, ev):
@@ -78,12 +78,24 @@ class MovingTargetDefense(app_manager.RyuApp):
                                 match=match)
         datapath.send_msg(mod)
 
-    def remove_flow(self, datapath, match):
-        parser = datapath.ofproto_parser
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, hard_timeout=None, idle_timeout=None):
         ofproto = datapath.ofproto
-        mod = parser.OFPFlowMod(datapath=datapath, command=ofproto.OFPFC_DELETE,
-                                out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
-                                match=match)
+        parser = datapath.ofproto_parser
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        if buffer_id:
+            if hard_timeout is None and idle_timeout is None:
+                mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id, priority=priority, match=match, instructions=inst)
+            else:
+                mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id, priority=priority, match=match, instructions=inst,
+                                        hard_timeout=hard_timeout if hard_timeout else 0,
+                                        idle_timeout=idle_timeout if idle_timeout else 0)
+        else:
+            if hard_timeout is None and idle_timeout is None:
+                mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst)
+            else:
+                mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst,
+                                        hard_timeout=hard_timeout if hard_timeout else 0,
+                                        idle_timeout=idle_timeout if idle_timeout else 0)
         datapath.send_msg(mod)
 
     def send_gratuitous_arp(self, real_ip, virtual_ip, datapath):
@@ -114,33 +126,59 @@ class MovingTargetDefense(app_manager.RyuApp):
         seed(time())
         pseudo_ranum = randint(0, len(self.Resources) - 1)
         self.prev_R2V_Mappings = self.R2V_Mappings.copy()
+
         for key in self.R2V_Mappings.keys():
             self.R2V_Mappings[key] = self.Resources[pseudo_ranum]
             pseudo_ranum = (pseudo_ranum + 1) % len(self.Resources)
+
         self.V2R_Mappings = {v: k for k, v in self.R2V_Mappings.items()}
-        print("Mapping updated! New:", self.R2V_Mappings, "Previous:", self.prev_R2V_Mappings)
+        self.logger.info("Mapping updated! New: %s Previous: %s", self.R2V_Mappings, self.prev_R2V_Mappings)
 
-        for curSwitch in self.datapaths:
-            self.EmptyTable(curSwitch)
-            parser = curSwitch.ofproto_parser
-            ofProto = curSwitch.ofproto
+        for datapath in self.datapaths:
+            self.EmptyTable(datapath)
+            parser = datapath.ofproto_parser
+            ofProto = datapath.ofproto
 
-            # Allow both new and previous mapping for GRACE_PERIOD
-            for real_ip in self.R2V_Mappings.keys():
-                prev_virtual_ip = self.prev_R2V_Mappings.get(real_ip)
-                new_virtual_ip = self.R2V_Mappings[real_ip]
-                # Add new mapping (permanent)
-                if new_virtual_ip:
-                    match_new = parser.OFPMatch(ipv4_dst=new_virtual_ip)
+            # Install flows for all active flows allowing seamless translation between old and new virtual IPs
+            for (src_ip, dst_ip) in self.active_flows.keys():
+                old_dst_virtual = self.prev_R2V_Mappings.get(dst_ip, None)
+                new_dst_virtual = self.R2V_Mappings.get(dst_ip, None)
+
+                if new_dst_virtual:
+                    match_new = parser.OFPMatch(ipv4_src=self.R2V_Mappings[src_ip], ipv4_dst=new_dst_virtual)
                     actions_new = [parser.OFPActionOutput(ofProto.OFPP_NORMAL)]
-                    self.add_flow(curSwitch, 10, match_new, actions_new)
-                    self.send_gratuitous_arp(real_ip, new_virtual_ip, curSwitch)
-                # Add previous mapping (with timeout)
-                if prev_virtual_ip and prev_virtual_ip != new_virtual_ip:
-                    match_prev = parser.OFPMatch(ipv4_dst=prev_virtual_ip)
-                    actions_prev = [parser.OFPActionOutput(ofProto.OFPP_NORMAL)]
-                    self.add_flow(curSwitch, 5, match_prev, actions_prev, hard_timeout=GRACE_PERIOD)
-                    self.send_gratuitous_arp(real_ip, prev_virtual_ip, curSwitch)
+                    self.add_flow(datapath, 20, match_new, actions_new)
+
+                # Flow for old dst virtual IP with grace period and header rewrite to new dst IP
+                # Rewrite destination IP from old virtual to new virtual for ongoing sessions
+                if old_dst_virtual and old_dst_virtual != new_dst_virtual:
+                    match_old = parser.OFPMatch(ipv4_src=self.R2V_Mappings[src_ip], ipv4_dst=old_dst_virtual)
+                    # Add set_field action for rewriting IPv4 destination address
+                    actions_old = [
+                        parser.OFPActionSetField(ipv4_dst=new_dst_virtual),
+                        parser.OFPActionOutput(ofProto.OFPP_NORMAL)
+                    ]
+                    self.add_flow(datapath, 15, match_old, actions_old, hard_timeout=GRACE_PERIOD)
+
+                # Similarly do for source IP translation - incoming packets rewriting source IPs for continuity
+                old_src_virtual = self.prev_R2V_Mappings.get(src_ip, None)
+                new_src_virtual = self.R2V_Mappings.get(src_ip, None)
+                if new_src_virtual:
+                    match_new_src = parser.OFPMatch(ipv4_src=new_src_virtual, ipv4_dst=self.R2V_Mappings[dst_ip])
+                    actions_new_src = [parser.OFPActionOutput(ofProto.OFPP_NORMAL)]
+                    self.add_flow(datapath, 20, match_new_src, actions_new_src)
+
+                if old_src_virtual and old_src_virtual != new_src_virtual:
+                    match_old_src = parser.OFPMatch(ipv4_src=old_src_virtual, ipv4_dst=self.R2V_Mappings[dst_ip])
+                    actions_old_src = [
+                        parser.OFPActionSetField(ipv4_src=new_src_virtual),
+                        parser.OFPActionOutput(ofProto.OFPP_NORMAL)
+                    ]
+                    self.add_flow(datapath, 15, match_old_src, actions_old_src, hard_timeout=GRACE_PERIOD)
+
+            # Send gratuitous ARP for new IPs too
+            for real_ip in self.R2V_Mappings.keys():
+                self.send_gratuitous_arp(real_ip, self.R2V_Mappings[real_ip], datapath)
 
     def isRealIPAddress(self, ipAddr):
         return ipAddr in self.R2V_Mappings.keys()
@@ -148,34 +186,8 @@ class MovingTargetDefense(app_manager.RyuApp):
     def isVirtualIPAddress(self, ipAddr):
         return ipAddr in self.R2V_Mappings.values() or ipAddr in self.prev_R2V_Mappings.values()
 
-    def isDirectContact(self, datapath, ipAddr):
-        if ipAddr in self.HostAttachments.keys():
-            if self.HostAttachments[ipAddr] == datapath:
-                return True
-            else:
-                return False
-        return True
-
-    def add_flow(self, datapath, priority, match, actions, buffer_id=None, hard_timeout=None):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        if buffer_id:
-            if hard_timeout is None:
-                mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id, priority=priority, match=match, instructions=inst)
-            else:
-                mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id, priority=priority, match=match, instructions=inst, hard_timeout=hard_timeout)
-        else:
-            if hard_timeout is None:
-                mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst)
-            else:
-                mod = parser.OFPFlowMod(datapath=datapath, priority=priority, match=match, instructions=inst, hard_timeout=hard_timeout)
-        datapath.send_msg(mod)
-
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def handlePacketInEvents(self, ev):
-        actions = []
-        pktDrop = False
         msg = ev.msg
         datapath = msg.datapath
         dpid = datapath.id
@@ -183,30 +195,30 @@ class MovingTargetDefense(app_manager.RyuApp):
         parser = datapath.ofproto_parser
         in_port = msg.match['in_port']
         pkt = packet.Packet(msg.data)
-        arp_Obj = pkt.get_protocol(arp.arp)
-        icmp_Obj = pkt.get_protocol(ipv4.ipv4)
-
-        if arp_Obj:
-            src = arp_Obj.src_ip
-            dst = arp_Obj.dst_ip
-            if self.isRealIPAddress(src) and src not in self.HostAttachments.keys():
-                self.HostAttachments[src] = datapath.id
-            # Same logic as before...
-            # You can add additional ARP rewriting logic here for better continuity
-
-        elif icmp_Obj:
-            src = icmp_Obj.src
-            dst = icmp_Obj.dst
-            # Allow ICMP between hosts mapped to both current and previous virtual IPs
-            dst_matched = dst in self.R2V_Mappings.values() or dst in self.prev_R2V_Mappings.values()
-            if dst_matched:
-                actions.append(parser.OFPActionOutput(ofproto.OFPP_FLOOD))
-            else:
-                pktDrop = True
 
         eth = pkt.get_protocols(ethernet.ethernet)[0]
         dst = eth.dst
         src = eth.src
+
+        arp_obj = pkt.get_protocol(arp.arp)
+        icmp_obj = pkt.get_protocol(ipv4.ipv4)
+
+        # Track active flows (src_ip, dst_ip) on each packet in - update only for real IPs
+        if arp_obj:
+            src_ip = arp_obj.src_ip
+            dst_ip = arp_obj.dst_ip
+
+            if self.isRealIPAddress(src_ip):
+                self.active_flows[(src_ip, dst_ip)] = time()
+
+        elif icmp_obj:
+            src_ip = icmp_obj.src
+            dst_ip = icmp_obj.dst
+
+            if self.isRealIPAddress(src_ip):
+                self.active_flows[(src_ip, dst_ip)] = time()
+
+        # Classic L2 learning switch logic preserved
         self.mac_to_port.setdefault(dpid, {})
         self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
         self.mac_to_port[dpid][src] = in_port
@@ -215,16 +227,21 @@ class MovingTargetDefense(app_manager.RyuApp):
             out_port = self.mac_to_port[dpid][dst]
         else:
             out_port = ofproto.OFPP_FLOOD
-        if not pktDrop:
+
+        actions = []
+        if not out_port == ofproto.OFPP_FLOOD:
             actions.append(parser.OFPActionOutput(out_port))
-        if out_port != ofproto.OFPP_FLOOD:
-            if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-                self.add_flow(datapath, 1, parser.OFPMatch(), actions, msg.buffer_id)
-                return
-            else:
-                self.add_flow(datapath, 1, parser.OFPMatch(), actions)
+        else:
+            actions.append(parser.OFPActionOutput(out_port))
+
+        if msg.buffer_id != ofproto.OFP_NO_BUFFER:
+            self.add_flow(datapath, 1, parser.OFPMatch(eth_src=src, eth_dst=dst), actions, msg.buffer_id)
+        else:
+            self.add_flow(datapath, 1, parser.OFPMatch(eth_src=src, eth_dst=dst), actions)
+
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
-        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port, actions=actions, data=data)
+        out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
+                                 actions=actions, data=data)
         datapath.send_msg(out)
