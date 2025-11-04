@@ -20,7 +20,7 @@ HOST_MAC_TABLE = {
     '10.0.0.8': '00:00:00:00:00:08'
 }
 
-GRACE_PERIOD = 20  # seconds to keep old mappings active
+GRACE_PERIOD = 20  # seconds to keep old mappings alive
 
 class EventMessage(event.EventBase):
     def __init__(self, message):
@@ -197,51 +197,82 @@ class MovingTargetDefense(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
 
         eth = pkt.get_protocols(ethernet.ethernet)[0]
-        dst = eth.dst
-        src = eth.src
+        dst_mac = eth.dst
+        src_mac = eth.src
 
         arp_obj = pkt.get_protocol(arp.arp)
         icmp_obj = pkt.get_protocol(ipv4.ipv4)
 
-        # Track active flows (src_ip, dst_ip) on each packet in - update only for real IPs
+        # Handle ARP requests - reply with correct MAC for virtual IP
+        if arp_obj and arp_obj.opcode == arp.ARP_REQUEST:
+            arp_dst_ip = arp_obj.dst_ip
+            # Check if the requested IP is one of our virtual IPs (current or previous)
+            if arp_dst_ip in self.R2V_Mappings.values() or arp_dst_ip in self.prev_R2V_Mappings.values():
+                # Find the real IP mapped to this virtual IP
+                real_ip_for_virtual = None
+                for real_ip, virt_ip in self.R2V_Mappings.items():
+                    if arp_dst_ip == virt_ip or arp_dst_ip == self.prev_R2V_Mappings.get(real_ip):
+                        real_ip_for_virtual = real_ip
+                        break
+
+                if real_ip_for_virtual:
+                    # Build ARP reply packet
+                    pkt_reply = packet.Packet()
+                    pkt_reply.add_protocol(ethernet.ethernet(
+                        ethertype=eth.ethertype,
+                        dst=src_mac,
+                        src=HOST_MAC_TABLE[real_ip_for_virtual]
+                    ))
+                    pkt_reply.add_protocol(arp.arp(
+                        opcode=arp.ARP_REPLY,
+                        src_mac=HOST_MAC_TABLE[real_ip_for_virtual],
+                        src_ip=arp_dst_ip,
+                        dst_mac=arp_obj.src_mac,
+                        dst_ip=arp_obj.src_ip
+                    ))
+                    pkt_reply.serialize()
+                    actions = [parser.OFPActionOutput(in_port)]
+                    out = parser.OFPPacketOut(
+                        datapath=datapath,
+                        buffer_id=ofproto.OFP_NO_BUFFER,
+                        in_port=ofproto.OFPP_CONTROLLER,
+                        actions=actions,
+                        data=pkt_reply.data)
+                    datapath.send_msg(out)
+                    return  # Finished ARP reply
+
+        # Track active flows (src_ip, dst_ip) on each ARP or ICMP packet
         if arp_obj:
             src_ip = arp_obj.src_ip
             dst_ip = arp_obj.dst_ip
-
             if self.isRealIPAddress(src_ip):
                 self.active_flows[(src_ip, dst_ip)] = time()
-
         elif icmp_obj:
             src_ip = icmp_obj.src
             dst_ip = icmp_obj.dst
-
             if self.isRealIPAddress(src_ip):
                 self.active_flows[(src_ip, dst_ip)] = time()
 
-        # Classic L2 learning switch logic preserved
         self.mac_to_port.setdefault(dpid, {})
-        self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
-        self.mac_to_port[dpid][src] = in_port
+        self.logger.info("packet in %s %s %s %s", dpid, src_mac, dst_mac, in_port)
+        self.mac_to_port[dpid][src_mac] = in_port
 
-        if dst in self.mac_to_port[dpid]:
-            out_port = self.mac_to_port[dpid][dst]
+        if dst_mac in self.mac_to_port[dpid]:
+            out_port = self.mac_to_port[dpid][dst_mac]
         else:
             out_port = ofproto.OFPP_FLOOD
 
-        actions = []
-        if not out_port == ofproto.OFPP_FLOOD:
-            actions.append(parser.OFPActionOutput(out_port))
-        else:
-            actions.append(parser.OFPActionOutput(out_port))
+        actions = [parser.OFPActionOutput(out_port)]
 
         if msg.buffer_id != ofproto.OFP_NO_BUFFER:
-            self.add_flow(datapath, 1, parser.OFPMatch(eth_src=src, eth_dst=dst), actions, msg.buffer_id)
+            self.add_flow(datapath, 1, parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac), actions, msg.buffer_id)
         else:
-            self.add_flow(datapath, 1, parser.OFPMatch(eth_src=src, eth_dst=dst), actions)
+            self.add_flow(datapath, 1, parser.OFPMatch(eth_src=src_mac, eth_dst=dst_mac), actions)
 
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
             data = msg.data
+
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
                                  actions=actions, data=data)
         datapath.send_msg(out)
